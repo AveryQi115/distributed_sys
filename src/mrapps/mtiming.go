@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"6.824/src/mr"
+	"distributed_sys/src/mr"
 )
 
 func nparallel(phase string) int {

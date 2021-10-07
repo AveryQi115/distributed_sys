@@ -1,3 +1,3 @@
-module 6.824
+module distributed_sys
 
 go 1.14

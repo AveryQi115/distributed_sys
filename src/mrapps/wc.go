@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode"
 
-	"6.824/src/mr"
+	"distributed_sys/src/mr"
 )
 
 //

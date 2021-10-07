@@ -12,7 +12,7 @@ import (
 	"strings"
 	"unicode"
 
-	"6.824/src/mr"
+	"distributed_sys/src/mr"
 )
 
 // The mapping function is called once for each piece of the input.

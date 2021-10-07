@@ -11,7 +11,7 @@ package main
 //
 
 import (
-	"6.824/src/mr"
+	"distributed_sys/src/mr"
 	"fmt"
 	"log"
 	"os"

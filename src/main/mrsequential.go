@@ -14,7 +14,7 @@ import (
 	"plugin"
 	"sort"
 
-	"6.824/src/mr"
+	"distributed_sys/src/mr"
 )
 
 // for sorting by key.

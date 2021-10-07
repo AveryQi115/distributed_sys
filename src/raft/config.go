@@ -8,7 +8,7 @@ package raft
 // test with the original before submitting.
 //
 
-import "../labrpc"
+import "distributed_sys/src/labrpc"
 import "log"
 import "sync"
 import "testing"
@@ -58,17 +58,19 @@ type config struct {
 var ncpu_once sync.Once
 
 func make_config(t *testing.T, n int, unreliable bool) *config {
+	// ncpu_once make sure the initialization process will only run once
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
 		}
 		rand.Seed(makeSeed())
 	})
+	// set four cpu can be work simultaneously
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
 	cfg.net = labrpc.MakeNetwork()
-	cfg.n = n
+	cfg.n = n								// the number of raft servers
 	cfg.applyErr = make([]string, cfg.n)
 	cfg.rafts = make([]*Raft, cfg.n)
 	cfg.connected = make([]bool, cfg.n)
@@ -134,6 +136,7 @@ func (cfg *config) crash1(i int) {
 // this server. since we cannot really kill it.
 //
 func (cfg *config) start1(i int) {
+	// if the server is already running, kill it first
 	cfg.crash1(i)
 
 	// a fresh set of outgoing ClientEnd names.
@@ -165,7 +168,9 @@ func (cfg *config) start1(i int) {
 	cfg.mu.Unlock()
 
 	// listen to messages from Raft indicating newly committed messages.
+	// ApplyMsg is the message sent from Raft server to the client to indicate the command has been committed
 	applyCh := make(chan ApplyMsg)
+	// simulate a client process to receive the ApplyMsg and send the command
 	go func() {
 		for m := range applyCh {
 			err_msg := ""
