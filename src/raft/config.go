@@ -186,6 +186,7 @@ func (cfg *config) start1(i int) {
 							m.CommandIndex, i, m.Command, j, old)
 					}
 				}
+
 				_, prevok := cfg.logs[i][m.CommandIndex-1]
 				cfg.logs[i][m.CommandIndex] = v
 				if m.CommandIndex > cfg.maxIndex {

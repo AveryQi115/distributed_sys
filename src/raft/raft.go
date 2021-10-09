@@ -19,6 +19,7 @@ package raft
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -99,7 +100,7 @@ type Raft struct {
 	// attributes used by leader
 	nextIndex		[]int				// for each server,index of the next log entry to send
 	matchIndex		[]int				// for each server,index of highest log entry known to be replicated
-	stopSendingHeartBeat chan bool		// Done signal for the SendHeartBeat Process
+	stopLeaderAction chan bool		// Done signal for the SendHeartBeat Process
 	applyChan		chan ApplyMsg		// applyChan for sending committed command reply back to client
 }
 
@@ -176,7 +177,6 @@ type AppendEntriesReply struct{
 // 1.(concurrent) Done if the leader change the state
 // 2.(concurrent) if the leader is outdated, call ConvertToFollower
 // 3.(concurrent) wait for 100 millisecond, go on next cycle
-// TODO: if the leader is outdated, the process will wait 100 millisecond and receive the signal after converting to follower
 func (rf *Raft) SendHeartBeat(){
 	rf.mu.Lock()
 	me := rf.me
@@ -185,53 +185,70 @@ func (rf *Raft) SendHeartBeat(){
 
 	for{
 		select{
-			case <- rf.stopSendingHeartBeat:
+			case <- rf.stopLeaderAction:
 				return
 			default:
-				countLock := sync.Mutex{}
-				count:=0
 				i := 0
-				rf.mu.Lock()
-				currentTerm := rf.currentTerm
-				commitIndex := rf.commitIndex
-				entries := rf.logEntries
-				matchIndex := rf.matchIndex
-				rf.mu.Unlock()
-
 				for i < peerCount{
-					if i != me{
-						go func(i int){
-							args := AppendEntriesArgs{
-								Term		: currentTerm,
-								LeaderID	: me,
-								PrevLogIndex: matchIndex[i],				//TODO:prevLogIndex
-								PrevLogTerm	: entries[matchIndex[i]].Term,	//TODO:prevLogTerm
-								Entries		: entries,
-								LeaderCommit: commitIndex,
-
-							}
-							reply := AppendEntriesReply{}
-							log.Printf("[raft.SendHeartBeat] raft server %v send heartBeat to server %v args:%v\n",me, i, args)
-
-							ok := false
-							ok=rf.sendAppendEntries(i,&args,&reply)
-
-							log.Printf("[raft.SendHeartBeat] raft server %v receive heartBeat reply from server %v:%v\n",me,i,reply)
-
-							// the leader is outdated
-							if ok && !reply.Success && reply.Term > currentTerm{
-								log.Printf("[raft.SendHeartBeat] raft server %v convert to follower\n",me)
-								go rf.ConvertToFollower()
-								return
-							}
-
-							if ok && reply.Success{
-								countLock.Lock()
-								count+=1
-								countLock.Unlock()
-							}
-						}(i)
+					rf.mu.Lock()
+					currentTerm := rf.currentTerm
+					commitIndex := rf.commitIndex
+					nextIndex := rf.nextIndex
+					entries := rf.logEntries	//TODO: only sending slices,and append according to current slice and prevLogIndex
+					var newEntries []LogEntry	// default:nil
+					if nextIndex[i]<len(entries){
+						newEntries = entries[nextIndex[i]:]	//TODO：sending all the remaining logs or commitIndex+1 log as the next index only increment by 1
 					}
+					rf.mu.Unlock()
+
+					go func(i int){
+						args := AppendEntriesArgs{
+							Term		: currentTerm,
+							LeaderID	: me,
+							PrevLogIndex: nextIndex[i]-1,				//TODO:prevLogIndex
+							PrevLogTerm	: entries[nextIndex[i]-1].Term,	//TODO:prevLogTerm
+							Entries		: newEntries,
+							LeaderCommit: commitIndex,
+						}
+						reply := AppendEntriesReply{}
+						log.Printf("[raft.SendHeartBeat] raft server %v send heartBeat to server %v args:%+v\n",me, i, args)
+
+						ok := false
+						ok=rf.sendAppendEntries(i,&args,&reply)
+
+						log.Printf("[raft.SendHeartBeat] raft server %v receive heartBeat reply from server %v:%+v\n",me,i,reply)
+
+						// the leader is outdated
+						if ok && !reply.Success && reply.Term > currentTerm{
+							rf.mu.Lock()
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1	//TODO:需要更新votedFor吗？
+							rf.lastHeartBeat = time.Now()
+							rf.mu.Unlock()
+							go rf.ConvertToFollower()
+							return
+						}
+
+						// the log isn't matched
+						// TODO:需不需要别的情况来表示matched
+						if ok && !reply.Success{
+							rf.mu.Lock()
+							rf.nextIndex[i] -= 1
+							rf.mu.Unlock()
+							return
+						}
+
+						// log matched, update nextIndex in the length limit
+						if ok && reply.Success{
+							rf.mu.Lock()
+							rf.matchIndex[i] = nextIndex[i]-1
+							if nextIndex[i] < len(rf.logEntries){
+								rf.nextIndex[i] += 1
+							}
+							rf.mu.Unlock()
+							return
+						}
+					}(i)
 					i += 1
 				}
 
@@ -242,6 +259,8 @@ func (rf *Raft) SendHeartBeat(){
 				// 设计策略1，yes大于半数继续：如果follower不响应，leader就卡住了，不会继续传heartbeat；server可能转candidate，增加term，leader转follower但是当前goroutine泄漏
 				// 设计策略2，yes小于半数转follower：什么时候统计小于半数？如果follower不响应，需要等待一段时间，一段时间怎么设计？
 				// 设计策略3： 不统计yes，对于没有reply的server，自然会转candidate，增加term，会导致leader转follower；但是浪费了很多资源给老leader发heartbeat
+
+				// TODO：设计策略1和3都不合适，考虑leader网络故障的情形，leader接受不到其他消息不会认为自己失败，再接入网络时可能因为log限制无法被选为leader，也
 		}
 	}
 }
@@ -255,13 +274,18 @@ func (rf *Raft) ConvertToFollower(){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// if already turned to follower, return
+	if rf.state == FOLLOWER{
+		return
+	}
+
 	log.Printf("[raft.ConvertToFollower] server %v convert to follower\n", rf.me)
 
 	if rf.state==LEADER{
-		rf.stopSendingHeartBeat <- true
+		log.Printf("[raft.ConvertToFollower] close channel for leader %v\n",rf.me)
+		close(rf.stopLeaderAction)	// close channel to stop all leader actions
 	}
 	rf.state = FOLLOWER
-	rf.lastHeartBeat = time.Now()
 }
 
 // ConvertToLeader is to convert the raft server to leader state
@@ -270,12 +294,13 @@ func (rf *Raft) ConvertToFollower(){
 // 2.(concurrent) send AppendEntries RPC to peers repeatedly during idle periods
 // 3.(concurrent) send AppendEntries RPC to peers if nextIndex satisfied
 // 4.(concurrent)(done by SendHeartBeat) if currentTerm is lower, convert to follower
+// 5.(concurrent) periodically update commitIndex according to matchIndex[], killed by convert to follower
 func (rf *Raft) ConvertToLeader(){
 	rf.mu.Lock()
 	log.Printf("[Raft.ConvertToLeader] raft server %v convert to leader\n",rf.me)
 	rf.state = LEADER
-	Done := make(chan bool)
-	rf.stopSendingHeartBeat = Done
+	Done := make(chan bool,2)
+	rf.stopLeaderAction = Done
 	rf.nextIndex = make([]int,len(rf.peers),len(rf.peers))
 	rf.matchIndex = make([]int,len(rf.peers),len(rf.peers))
 	for i:=0;i<len(rf.peers);i++{
@@ -284,10 +309,8 @@ func (rf *Raft) ConvertToLeader(){
 	}
 	rf.mu.Unlock()
 
-	//TODO: reinitialize nextIndex[] and matchIndex[]
-
 	go rf.SendHeartBeat()
-	//TODO: AppendEntries according serveral index
+	go rf.CheckCommitted()
 }
 
 
@@ -331,9 +354,7 @@ func (rf *Raft) ConvertToCandidate(){
 				LastLogTerm		: logEntries[len(logEntries)-1].Term,
 			}
 			reply := RequestVoteReply{}
-			log.Printf("[Raft.ConvertToCandidate] raft server %v send request to server %v for vote: %v\n",me, i, args)
 			rf.sendRequestVote(i,&args,&reply)
-			log.Printf("[Raft.ConvertToCandidate] raft server %v receive reply from server %v: %v\n",me, i, reply)
 			if reply.VoteGranted{
 				countLock.Lock()
 				count += 1
@@ -353,12 +374,52 @@ func (rf *Raft) ConvertToCandidate(){
 	}
 }
 
+// CheckCommitted check if the majority of log entries in specifc index has been committed
+// happens along with an active leader
+// 1.(concurrent) Done if the leader change the state
+// 2. If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+// TODO: 自己的matchIndex怎么算？目前操作是sendHeartBeat也要传给自己
+func (rf *Raft) CheckCommitted(){
+	for{
+		select{
+		case <- rf.stopLeaderAction:
+			return
+		default:
+			rf.mu.Lock()
+			commitIndex := rf.commitIndex
+			entries := rf.logEntries
+			maxN := getMedian(rf.matchIndex)
+			currentTerm := rf.currentTerm
+			rf.mu.Unlock()
+
+			for i:=maxN;i>commitIndex;i--{
+				if entries[i].Term==currentTerm{
+					// Update commitIndex
+					rf.mu.Lock()
+					oldCommit := rf.commitIndex
+					rf.commitIndex = i
+					log.Printf("[Raft.CheckCommitted] leader %v committed log index %v and logs before it.\n",rf.me,i)
+					rf.mu.Unlock()
+
+					//TODO: 设计1： for each index committed, send back apply Msg
+					//		设计2： 只传回最后commit的操作？
+					for j:=oldCommit+1; j <= i;j++{
+						rf.applyChan<-ApplyMsg{true,entries[j].Command,j}
+					}
+					break
+				}
+			}
+
+			//TODO: 休息多久？
+			time.Sleep(10*time.Millisecond)
+		}
+	}
+}
+
 func (rf *Raft) CheckElectionTimeout(){
 	rf.mu.Lock()
 	if rf.state != LEADER {
-		log.Printf("[Raft.CheckElectionTimeout] raft server %v check for the election timeout\n",rf.me)
 		if time.Now().Sub(rf.lastHeartBeat) >= rf.electionTimeout {
-			log.Printf("[Raft.CheckElectionTimeout] raft server %v convert to candidate\n",rf.me)
 			rf.mu.Unlock()
 			go rf.ConvertToCandidate()
 			return
@@ -366,7 +427,6 @@ func (rf *Raft) CheckElectionTimeout(){
 	}
 	rf.mu.Unlock()
 }
-
 
 func (rf *Raft) Check(){
 	rf.mu.Lock()
@@ -386,12 +446,38 @@ func MatchPrevLog(entries []LogEntry, prevLogIndex int, prevLogTerm int)bool{
 	return entries[prevLogIndex].Term == prevLogTerm
 }
 
-func DeleteConflictLogEntries(entries []LogEntry, newEntries []LogEntry){
+func UpdateNewEntries(entries []LogEntry, newEntries []LogEntry, prevLogIndex int)[]LogEntry{
+	if newEntries==nil || len(newEntries)==0{
+		return entries
+	}
 
-}
+	oldPointer := prevLogIndex+1
+	newPointer := 0
+	for oldPointer < len(entries) && newPointer < len(newEntries){
+		if entries[oldPointer].Term == newEntries[newPointer].Term{
+			oldPointer+=1
+			newPointer+=1
+			continue
+		} else{
+			entries = entries[:oldPointer]
+			for newPointer < len(newEntries){
+				entries = append(entries,newEntries[newPointer])
+				newPointer+=1
+			}
+			return entries
+		}
+	}
 
-func AppendNewEntries(entries []LogEntry, newEntries []LogEntry){
-	
+	if oldPointer < len(entries){
+		return entries
+	}
+
+	for newPointer < len(newEntries){
+		entries = append(entries,newEntries[newPointer])
+		newPointer+=1
+	}
+
+	return entries
 }
 
 // AppendEntries is the heartbeat msg or the appending entries msg
@@ -403,7 +489,6 @@ func AppendNewEntries(entries []LogEntry, newEntries []LogEntry){
 // 5b. if the server is behind the leader term, convert to follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply){
 	rf.mu.Lock()
-	log.Printf("[raft.AppendEntries] server %v receive append entries call, arg = %v",rf.me,args)
 
 	// false leader has lower term, return false
 	if args.Term < rf.currentTerm{
@@ -411,6 +496,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		reply.Success = false
 		rf.mu.Unlock()
 		return
+	}
+
+	// the term of current server is behind the leader term, convert to follower, reset timer
+	if args.Term > rf.currentTerm{
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.lastHeartBeat = time.Now()
+		rf.mu.Unlock()
+
+		go rf.ConvertToFollower()
+
+		rf.mu.Lock()
+	} else {
+		rf.lastHeartBeat = time.Now()
 	}
 
 	// prevLogIndex and prevLogTerm don't match, return false
@@ -421,33 +520,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		return
 	}
 
-	DeleteConflictLogEntries(rf.logEntries,args.Entries)
-
-	AppendNewEntries(rf.logEntries,args.Entries)
+	rf.logEntries = UpdateNewEntries(rf.logEntries,args.Entries,args.PrevLogIndex)
 
 	if args.LeaderCommit > rf.commitIndex{
+		oldCommit := rf.commitIndex
 		if args.LeaderCommit < len(rf.logEntries)-1{
 			rf.commitIndex = args.LeaderCommit
 		}else {
 			rf.commitIndex = len(rf.logEntries)-1
 		}
+		for i:=oldCommit+1; i <= rf.commitIndex;i++{
+			rf.applyChan<-ApplyMsg{true,rf.logEntries[i].Command,i}
+		}
 	}
 
-	// the term of current server is behind the leader term, convert to follower, reset timer
-	currentTerm := rf.currentTerm
-	if args.Term > rf.currentTerm{
-		rf.currentTerm = args.Term
-		currentTerm = rf.currentTerm
-		rf.mu.Unlock()
+	log.Printf("[raft.AppendEntries] server %v update entries: %+v,committed on index %v\n",rf.me,rf.logEntries,rf.commitIndex)
 
-		go rf.ConvertToFollower()
-	} else {
-		rf.lastHeartBeat = time.Now()
-		rf.mu.Unlock()
-	}
-
-	reply.Term = currentTerm
+	reply.Term = rf.currentTerm
 	reply.Success = true
+	rf.mu.Unlock()
 	return
 }
 
@@ -486,27 +577,22 @@ type RequestVoteReply struct {
 // 1. if the leader is outdated return false
 // 2. if the leader have already voted and votedFor != args.candidateId return false
 // 3. grant vote if the candidate log is more or equally up-to-date
+// 4. reset timer if vote granted
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	log.Printf("[raft.RequestVote.BeforeLock] server receive vote request from server %v args = %v\n",args.CandidateId, args)
 	rf.mu.Lock()
-	log.Printf("[raft.RequestVote] server %v receive vote request from server %v args = %v\n",rf.me, args.CandidateId, args)
 
-	// vote并且立马更新currentTerm，convertToFollower
+	// 如果leader处于更高term,convert to follower并且立即更新term
+	// 但是需要通过后续的检查才能vote
 	if args.Term > rf.currentTerm{
 		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
-		log.Printf("[raft.RequestVote] server %v vote for a higher term candidate %v,currentTerm =%v\n",rf.me,args.CandidateId,rf.currentTerm)
-		log.Printf("[raft.RequestVote] server %v convert to follower \n",rf.me)
+		rf.votedFor = -1
 		rf.mu.Unlock()
 
 		go rf.ConvertToFollower()
-		return
+		rf.mu.Lock()
 	}
 
 	if args.Term < rf.currentTerm{
-		log.Printf("[raft.RequestVote] server %v refuse to vote for server %v cause leader term %v outdated.\n",rf.me,args.CandidateId,args.Term)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
@@ -514,7 +600,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.votedFor!=-1 && rf.votedFor != args.CandidateId{
-		log.Printf("[raft.RequestVote] server %v refuse to vote for server %v cause already vote for %v.\n",rf.me,args.CandidateId,rf.votedFor)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
@@ -533,7 +618,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	log.Printf("[raft.RequestVote] server %v refuse to vote for server %v cause last log(Index:%v,Term:%v) are more uptodate than args:(Index:%v,Term:%v).\n",rf.me,args.CandidateId,lastIndex,lastTerm,args.LastLogIndex,args.LastLogTerm)
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
@@ -589,13 +673,38 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+//TODO: return gracefully even if the Raft instance has been killed !!!
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := 0
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
+	// if current server isn't leader, return false
+	term,isLeader = rf.GetState()
+	if !isLeader{
+		return index,term,isLeader
+	}
 
+	rf.mu.Lock()
+	rf.logEntries = append(rf.logEntries,LogEntry{
+		Term: rf.currentTerm,
+		Command: command,
+	})
+	index = len(rf.logEntries)-1
+	rf.mu.Unlock()
+
+	//for true{
+	//	select{
+	//		case <-rf.stopLeaderAction:
+	//			return index,term,false
+	//		case applyMsg := <-rf.applyChan:
+	//			log.Printf("[raft.Start] got applyMsg:%+v\n",applyMsg)
+	//			if applyMsg.CommandValid{
+	//				return applyMsg.CommandIndex,term,isLeader
+	//			}
+	//	}
+	//}
 
 	return index, term, isLeader
 }
@@ -660,4 +769,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func getMedian(arr []int)int{
+	arrCopy := make([]int,len(arr))
+	for i,_ := range arrCopy{
+		arrCopy[i] = arr[i]
+	}
+	sort.Ints(arrCopy)
+	return arrCopy[len(arr)/2]
 }
