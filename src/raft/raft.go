@@ -153,19 +153,11 @@ func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm int
-	var votedFor int
-	var logEntries []LogEntry
-	if d.Decode(&currentTerm) != nil ||
-	   d.Decode(&votedFor) != nil ||
-		d.Decode(&logEntries) != nil {
-	} else {
-		rf.mu.Lock()
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-		rf.logEntries = logEntries
-		rf.mu.Unlock()
-	}
+	rf.mu.Lock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logEntries)
+	rf.mu.Unlock()
 }
 
 type AppendEntriesArgs struct{
@@ -212,6 +204,11 @@ func (rf *Raft) SendHeartBeat(){
 					currentTerm := rf.currentTerm
 					commitIndex := rf.commitIndex
 					prevLogIndex := rf.nextIndex[i] - 1
+					if prevLogIndex > len(rf.logEntries){
+						DPrintf("[rf.SendHeartBeat] leader = %v, prevLogIndex > len(rf.logEntries),i=%v,prevLogIndex=%v,len(rf.logEntries)=%v\n",rf.me,i,prevLogIndex,len(rf.logEntries))
+						prevLogIndex = len(rf.logEntries)-1
+						rf.nextIndex[i] = len(rf.logEntries)
+					}
 					prevLogTerm := rf.logEntries[prevLogIndex].Term
 					var newEntries []LogEntry	// default:nil
 					if prevLogIndex + 1<len(rf.logEntries){
@@ -283,6 +280,7 @@ func (rf *Raft) SendHeartBeat(){
 							rf.mu.Unlock()
 							return
 						}
+
 					}(i, currentTerm, commitIndex, prevLogIndex ,prevLogTerm, newEntries)
 					i += 1
 				}
@@ -336,6 +334,7 @@ func (rf *Raft) ConvertToLeader(){
 		rf.nextIndex[i] = len(rf.logEntries)
 		rf.matchIndex[i] = 0
 	}
+	rf.matchIndex[rf.me] = len(rf.logEntries)-1
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -412,26 +411,22 @@ func (rf *Raft) CheckCommitted(){
 			rf.mu.Unlock()
 			return
 		default:
-			commitIndex := rf.commitIndex
-			entries := rf.logEntries
 			maxN := getMedian(rf.matchIndex)
-			currentTerm := rf.currentTerm
-			rf.mu.Unlock()
 
-			for i:=maxN;i>commitIndex;i--{
-				if entries[i].Term==currentTerm{
+			for i:=maxN;i>rf.commitIndex;i--{
+				if rf.logEntries[i].Term==rf.currentTerm{
 					// Update commitIndex
-					rf.mu.Lock()
 					oldCommit := rf.commitIndex
 					rf.commitIndex = i
-					rf.mu.Unlock()
 
+					DPrintf("[rf.CheckCommitted] %v committed from index %v to index %v \n", rf.me,oldCommit+1,i)
 					for j:=oldCommit+1; j <= i;j++{
-						rf.applyChan<-ApplyMsg{true,entries[j].Command,j}
+						rf.applyChan<-ApplyMsg{true,rf.logEntries[j].Command,j}
 					}
 					break
 				}
 			}
+			rf.mu.Unlock()
 
 			time.Sleep(10*time.Millisecond)
 		}
@@ -574,6 +569,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 	}
 
 	rf.logEntries = UpdateNewEntries(rf.logEntries,args.Entries,args.PrevLogIndex)
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex{
 		oldCommit := rf.commitIndex
@@ -582,6 +578,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		}else {
 			rf.commitIndex = len(rf.logEntries)-1
 		}
+		DPrintf("[rf.AppendEntries] %v committed from index %v to index %v \n", rf.me,oldCommit+1,rf.commitIndex)
 		for i:=oldCommit+1; i <= rf.commitIndex;i++{
 			rf.applyChan<-ApplyMsg{true,rf.logEntries[i].Command,i}
 		}
@@ -589,7 +586,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.persist()
 	rf.mu.Unlock()
 	return
 }
