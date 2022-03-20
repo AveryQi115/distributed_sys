@@ -20,7 +20,7 @@ package raft
 import (
 	"bytes"
 	"distributed_sys/src/labgob"
-	"log"
+	//"log"
 	"sort"
 	"sync"
 	"time"
@@ -90,9 +90,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm		int					// mark the current election term
 	votedFor		int					// mark the leader server votedFor
+	votes			int					// mark the committed votes for self
 	state			ElectionState		// the current state of the server
 	lastHeartBeat	time.Time			// last time the server receives heart beat msg
-	electionTimeout time.Duration
 	stopElectionCheck chan int			// kill check go routine
 
 	// attributes relative to logs
@@ -132,11 +132,9 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	rf.mu.Lock()
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logEntries)
-	rf.mu.Unlock()
 
 	data := w.Bytes()
 
@@ -161,7 +159,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 	   d.Decode(&votedFor) != nil ||
 		d.Decode(&logEntries) != nil {
-		log.Printf("[raft.readPersist] decoding error, data=%v\n",data)
 	} else {
 		rf.mu.Lock()
 		rf.currentTerm = currentTerm
@@ -204,6 +201,7 @@ func (rf *Raft) SendHeartBeat(){
 		rf.mu.Lock()
 		select{
 			case <- rf.stopLeaderAction:
+				rf.persist()
 				rf.mu.Unlock()
 				return
 			default:
@@ -243,14 +241,15 @@ func (rf *Raft) SendHeartBeat(){
 								rf.currentTerm = reply.Term		// 单增，只会在reply.Term更大的时候
 								rf.votedFor = -1
 								rf.lastHeartBeat = time.Now()
-								rf.mu.Unlock()
 								rf.persist()
+								rf.mu.Unlock()
 								go rf.ConvertToFollower()
 								return
 							}
 
 							// false return due to network error
 							if reply.XTerm ==0 && reply.Len==0{
+								rf.persist()
 								rf.mu.Unlock()
 								return
 							}
@@ -266,6 +265,7 @@ func (rf *Raft) SendHeartBeat(){
 							} else{
 								rf.nextIndex[i] = pos
 							}
+							rf.persist()
 							rf.mu.Unlock()
 							return
 						}
@@ -279,22 +279,14 @@ func (rf *Raft) SendHeartBeat(){
 									rf.nextIndex[i] += 1
 								}
 							}
+							rf.persist()
 							rf.mu.Unlock()
 							return
 						}
 					}(i, currentTerm, commitIndex, prevLogIndex ,prevLogTerm, newEntries)
 					i += 1
 				}
-
-				time.Sleep(50*time.Millisecond)
-
-				//TODO：论文里要求leader需要在没有得到大部分的yes reply之后转为follower state
-				// 设计难点：统计yes个数，两种策略：yes小于半数，转follower；yes大于半数，继续
-				// 设计策略1，yes大于半数继续：如果follower不响应，leader就卡住了，不会继续传heartbeat；server可能转candidate，增加term，leader转follower但是当前goroutine泄漏
-				// 设计策略2，yes小于半数转follower：什么时候统计小于半数？如果follower不响应，需要等待一段时间，一段时间怎么设计？
-				// 设计策略3： 不统计yes，对于没有reply的server，自然会转candidate，增加term，会导致leader转follower；但是浪费了很多资源给老leader发heartbeat
-
-				// TODO：设计策略1和3都不合适，考虑leader网络故障的情形，leader接受不到其他消息不会认为自己失败，再接入网络时可能因为log限制无法被选为leader，也
+				time.Sleep(60*time.Millisecond)
 		}
 	}
 }
@@ -307,13 +299,12 @@ func (rf *Raft) SendHeartBeat(){
 func (rf *Raft) ConvertToFollower(){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("[rf.ConvertToFollower] %v converts to follower\n", rf.me)
 
 	// if already turned to follower, return
 	if rf.state == FOLLOWER{
 		return
 	}
-
-	log.Printf("[raft.ConvertToFollower] server %v convert to follower\n", rf.me)
 
 	if rf.state==LEADER{
 		close(rf.stopLeaderAction)	// close channel to stop all leader actions
@@ -330,7 +321,12 @@ func (rf *Raft) ConvertToFollower(){
 // 5.(concurrent) periodically update commitIndex according to matchIndex[], killed by convert to follower
 func (rf *Raft) ConvertToLeader(){
 	rf.mu.Lock()
-	log.Printf("[Raft.ConvertToLeader] raft server %v convert to leader\n",rf.me)
+	if rf.state == LEADER{
+		rf.mu.Unlock()
+		return
+	}
+
+	DPrintf("[rf.ConvertToLeader] %v converts to leader\n", rf.me)
 	rf.state = LEADER
 	Done := make(chan bool,2)
 	rf.stopLeaderAction = Done
@@ -340,8 +336,8 @@ func (rf *Raft) ConvertToLeader(){
 		rf.nextIndex[i] = len(rf.logEntries)
 		rf.matchIndex[i] = 0
 	}
+	rf.persist()
 	rf.mu.Unlock()
-	defer rf.persist()
 
 	go rf.SendHeartBeat()
 	go rf.CheckCommitted()
@@ -358,21 +354,20 @@ func (rf *Raft) ConvertToLeader(){
 // 5b. convert to leader
 func (rf *Raft) ConvertToCandidate(){
 	rf.mu.Lock()
+	DPrintf("[rf.ConvertToCandidate] %v converts to candidate\n", rf.me)
 	rf.state = CANDIDATE
 	rf.lastHeartBeat = time.Now()
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.votes = 1
 
 	peerLen := len(rf.peers)
 	me := rf.me
 	currentTerm := rf.currentTerm
 	logEntries := rf.logEntries
+	rf.persist()
 	rf.mu.Unlock()
-	defer rf.persist()
 
-	countLock := sync.Mutex{}
-	voteChannel := make(chan bool)
-	count := 1
 	i := 0
 	for i < peerLen{
 		if i == me{
@@ -390,21 +385,17 @@ func (rf *Raft) ConvertToCandidate(){
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(i,&args,&reply)
 			if reply.VoteGranted{
-				countLock.Lock()
-				count += 1
-				if count > peerLen/2{
-					voteChannel <- true
+				rf.mu.Lock()
+				rf.votes += 1
+				if rf.votes > len(rf.peers)/2{
+					rf.mu.Unlock()
+					go rf.ConvertToLeader()
+					return
 				}
-				countLock.Unlock()
+				rf.mu.Unlock()
 			}
 		}(i)
 		i += 1
-	}
-
-	// Todo: 如果一直没有收到ok，这条goroutine不会return，check发起第二轮checkTimeout
-	if ok := <-voteChannel;ok{
-		go rf.ConvertToLeader()
-		return
 	}
 }
 
@@ -412,18 +403,13 @@ func (rf *Raft) ConvertToCandidate(){
 // happens along with an active leader
 // 1.(concurrent) Done if the leader change the state
 // 2. If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-// TODO: 自己的matchIndex怎么算？目前操作是sendHeartBeat也要传给自己
 func (rf *Raft) CheckCommitted(){
-	rf.mu.Lock()
-	me := rf.me
-	rf.mu.Unlock()
-
 	for{
 		rf.mu.Lock()
 		select{
 		case <- rf.stopLeaderAction:
+			rf.persist()
 			rf.mu.Unlock()
-			log.Printf("[raft.CheckCommitted] server %v check committed go routine have been properly killed\n",me)
 			return
 		default:
 			commitIndex := rf.commitIndex
@@ -438,11 +424,8 @@ func (rf *Raft) CheckCommitted(){
 					rf.mu.Lock()
 					oldCommit := rf.commitIndex
 					rf.commitIndex = i
-					log.Printf("[Raft.CheckCommitted] leader %v committed log index %v and logs before it.\n",rf.me,i)
 					rf.mu.Unlock()
 
-					//TODO: 设计1： for each index committed, send back apply Msg
-					//		设计2： 只传回最后commit的操作？
 					for j:=oldCommit+1; j <= i;j++{
 						rf.applyChan<-ApplyMsg{true,entries[j].Command,j}
 					}
@@ -450,7 +433,6 @@ func (rf *Raft) CheckCommitted(){
 				}
 			}
 
-			//TODO: 休息多久？
 			time.Sleep(10*time.Millisecond)
 		}
 	}
@@ -459,7 +441,7 @@ func (rf *Raft) CheckCommitted(){
 func (rf *Raft) CheckElectionTimeout(){
 	rf.mu.Lock()
 	if rf.state != LEADER {
-		if time.Now().Sub(rf.lastHeartBeat) >= rf.electionTimeout {
+		if time.Now().Sub(rf.lastHeartBeat) >= time.Duration(200 + rand.Intn(300)) * time.Millisecond {
 			rf.mu.Unlock()
 			go rf.ConvertToCandidate()
 			return
@@ -469,16 +451,12 @@ func (rf *Raft) CheckElectionTimeout(){
 }
 
 func (rf *Raft) Check(){
-	rf.mu.Lock()
-	electionTimeout := rf.electionTimeout
-	rf.mu.Unlock()
-
 	for true{
 		select{
 			case <-rf.stopElectionCheck:
 				return
 			default:
-				time.Sleep(electionTimeout)
+				time.Sleep(time.Duration(200 + rand.Intn(300)) * time.Millisecond)
 				go rf.CheckElectionTimeout()
 		}
 	}
@@ -563,8 +541,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 	if args.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 		return
 	}
 
@@ -573,6 +551,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.lastHeartBeat = time.Now()
+		rf.persist()
 		rf.mu.Unlock()
 
 		go rf.ConvertToFollower()
@@ -589,8 +568,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		reply.XTerm = XTerm
 		reply.XIndex = XIndex
 		reply.Len = Len
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 		return
 	}
 
@@ -610,8 +589,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.mu.Unlock()
 	rf.persist()
+	rf.mu.Unlock()
 	return
 }
 
@@ -659,8 +638,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm{
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 
 		go rf.ConvertToFollower()
 		rf.mu.Lock()
@@ -669,6 +648,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm{
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
@@ -676,6 +656,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor!=-1 && rf.votedFor != args.CandidateId{
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
@@ -688,15 +669,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 		return
 	}
 
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
 	rf.persist()
+	rf.mu.Unlock()
 	return
 }
 
@@ -749,7 +730,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-//TODO: return gracefully even if the Raft instance has been killed !!!
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := 0
 	term := -1
@@ -768,20 +748,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	index = len(rf.logEntries)-1
-	rf.mu.Unlock()
 	rf.persist()
-
-	//for true{
-	//	select{
-	//		case <-rf.stopLeaderAction:
-	//			return index,term,false
-	//		case applyMsg := <-rf.applyChan:
-	//			log.Printf("[raft.Start] got applyMsg:%+v\n",applyMsg)
-	//			if applyMsg.CommandValid{
-	//				return applyMsg.CommandIndex,term,isLeader
-	//			}
-	//	}
-	//}
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -836,13 +804,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1	// null
+	rf.votes = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.logEntries = make([]LogEntry,0,5)
 	rf.logEntries = append(rf.logEntries,LogEntry{0,nil})	// default value, not used, initial index = 1
 	rf.applyChan = applyCh
 	rf.lastHeartBeat = time.Now()	// so that every server is initialized with a different time
-	rf.electionTimeout = time.Duration(100 + rand.Intn(200)) * time.Millisecond
 	rf.stopElectionCheck = make(chan int)
 
 	rf.state = FOLLOWER
@@ -861,5 +829,5 @@ func getMedian(arr []int)int{
 		arrCopy[i] = arr[i]
 	}
 	sort.Ints(arrCopy)
-	return arrCopy[len(arr)/2]
+	return arrCopy[(len(arr)-1)/2]
 }
