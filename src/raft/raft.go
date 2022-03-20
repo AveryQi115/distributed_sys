@@ -201,6 +201,19 @@ func (rf *Raft) SendHeartBeat(){
 				i := 0
 				for i < peerCount{
 					rf.mu.Lock()
+					if rf.state != LEADER{
+						rf.mu.Unlock()
+						return
+					}
+					if rf.me == i{
+						rf.matchIndex[i] = rf.nextIndex[i]-1
+						if rf.nextIndex[i] < len(rf.logEntries){
+							rf.nextIndex[i] += 1
+						}
+						rf.mu.Unlock()
+						i+=1
+						continue
+					}
 					currentTerm := rf.currentTerm
 					commitIndex := rf.commitIndex
 					prevLogIndex := rf.nextIndex[i] - 1
@@ -213,7 +226,7 @@ func (rf *Raft) SendHeartBeat(){
 					var newEntries []LogEntry	// default:nil
 					if prevLogIndex + 1<len(rf.logEntries){
 						newEntries = make([]LogEntry,len(rf.logEntries)-prevLogIndex-1)
-						copy(newEntries,rf.logEntries[prevLogIndex+1:])	//TODO：sending all the remaining logs or commitIndex+1 log as the next index only increment by 1
+						copy(newEntries,rf.logEntries[prevLogIndex+1:])
 					}
 					rf.mu.Unlock()
 
@@ -231,9 +244,14 @@ func (rf *Raft) SendHeartBeat(){
 						ok := false
 						ok = rf.sendAppendEntries(i,&args,&reply)
 
+						rf.mu.Lock()
+						if rf.state!=LEADER{
+							rf.mu.Unlock()
+							return
+						}
+
 						if ok && !reply.Success{
 							// if the current Term is less than reply Term
-							rf.mu.Lock()
 							if reply.Term > rf.currentTerm{
 								rf.currentTerm = reply.Term		// 单增，只会在reply.Term更大的时候
 								rf.votedFor = -1
@@ -269,7 +287,6 @@ func (rf *Raft) SendHeartBeat(){
 
 						// log matched, update nextIndex in the length limit
 						if ok && reply.Success{
-							rf.mu.Lock()
 							if rf.matchIndex[i] <= prevLogIndex{
 								rf.matchIndex[i] = prevLogIndex
 								if rf.nextIndex[i] < len(rf.logEntries){
@@ -280,7 +297,7 @@ func (rf *Raft) SendHeartBeat(){
 							rf.mu.Unlock()
 							return
 						}
-
+						rf.mu.Unlock()
 					}(i, currentTerm, commitIndex, prevLogIndex ,prevLogTerm, newEntries)
 					i += 1
 				}
@@ -334,7 +351,6 @@ func (rf *Raft) ConvertToLeader(){
 		rf.nextIndex[i] = len(rf.logEntries)
 		rf.matchIndex[i] = 0
 	}
-	rf.matchIndex[rf.me] = len(rf.logEntries)-1
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -416,13 +432,13 @@ func (rf *Raft) CheckCommitted(){
 			for i:=maxN;i>rf.commitIndex;i--{
 				if rf.logEntries[i].Term==rf.currentTerm{
 					// Update commitIndex
-					oldCommit := rf.commitIndex
 					rf.commitIndex = i
 
-					DPrintf("[rf.CheckCommitted] %v committed from index %v to index %v \n", rf.me,oldCommit+1,i)
-					for j:=oldCommit+1; j <= i;j++{
+					DPrintf("[rf.CheckCommitted] %v committed from index %v to index %v, len(logEntries)=%v \n", rf.me,rf.lastApplied+1,i,len(rf.logEntries))
+					for j:=rf.lastApplied+1; j <= i;j++{
 						rf.applyChan<-ApplyMsg{true,rf.logEntries[j].Command,j}
 					}
+					rf.lastApplied = rf.commitIndex
 					break
 				}
 			}
@@ -572,16 +588,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex{
-		oldCommit := rf.commitIndex
 		if args.LeaderCommit < len(rf.logEntries)-1{
 			rf.commitIndex = args.LeaderCommit
 		}else {
 			rf.commitIndex = len(rf.logEntries)-1
 		}
-		DPrintf("[rf.AppendEntries] %v committed from index %v to index %v \n", rf.me,oldCommit+1,rf.commitIndex)
-		for i:=oldCommit+1; i <= rf.commitIndex;i++{
+		DPrintf("[rf.AppendEntries] %v committed from index %v to index %v, len(logEntries)=%v \n", rf.me,rf.lastApplied+1,rf.commitIndex,len(rf.logEntries))
+		for i:=rf.lastApplied+1; i <= rf.commitIndex;i++{
 			rf.applyChan<-ApplyMsg{true,rf.logEntries[i].Command,i}
 		}
+		rf.lastApplied = rf.commitIndex
 	}
 
 	reply.Term = rf.currentTerm
@@ -728,26 +744,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := 0
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
 	// if current server isn't leader, return false
-	term,isLeader = rf.GetState()
-	if !isLeader{
-		return index,term,isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state!=LEADER{
+		return index,rf.currentTerm,false
 	}
 
-	rf.mu.Lock()
 	rf.logEntries = append(rf.logEntries,LogEntry{
 		Term: rf.currentTerm,
 		Command: command,
 	})
 	index = len(rf.logEntries)-1
 	rf.persist()
-	rf.mu.Unlock()
 
-	return index, term, isLeader
+	return index, rf.currentTerm, true
 }
 
 //
