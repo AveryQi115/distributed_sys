@@ -190,14 +190,13 @@ func (rf *Raft) SendHeartBeat(){
 	rf.mu.Unlock()
 
 	for{
-		rf.mu.Lock()
 		select{
 			case <- rf.stopLeaderAction:
+				rf.mu.Lock()
 				rf.persist()
 				rf.mu.Unlock()
 				return
-			default:
-				rf.mu.Unlock()
+			case <- time.After(30*time.Millisecond):
 				i := 0
 				for i < peerCount{
 					rf.mu.Lock()
@@ -208,7 +207,7 @@ func (rf *Raft) SendHeartBeat(){
 					if rf.me == i{
 						rf.matchIndex[i] = rf.nextIndex[i]-1
 						if rf.nextIndex[i] < len(rf.logEntries){
-							rf.nextIndex[i] += 1
+							rf.nextIndex[i] = len(rf.logEntries)
 						}
 						rf.mu.Unlock()
 						i+=1
@@ -301,7 +300,6 @@ func (rf *Raft) SendHeartBeat(){
 					}(i, currentTerm, commitIndex, prevLogIndex ,prevLogTerm, newEntries)
 					i += 1
 				}
-				time.Sleep(60*time.Millisecond)
 		}
 	}
 }
@@ -371,7 +369,7 @@ func (rf *Raft) ConvertToCandidate(){
 	rf.mu.Lock()
 	DPrintf("[rf.ConvertToCandidate] %v converts to candidate\n", rf.me)
 	rf.state = CANDIDATE
-	rf.lastHeartBeat = time.Now()
+	rf.lastHeartBeat = time.Now().Add(200 * time.Millisecond)
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.votes = 1
@@ -399,16 +397,27 @@ func (rf *Raft) ConvertToCandidate(){
 			}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(i,&args,&reply)
-			if reply.VoteGranted{
-				rf.mu.Lock()
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm{
+				rf.currentTerm = reply.Term		// 单增，只会在reply.Term更大的时候
+				rf.votedFor = -1
+				rf.lastHeartBeat = time.Now()
+				rf.persist()
+				rf.mu.Unlock()
+				go rf.ConvertToFollower()
+				return
+			}
+			if reply.Term == rf.currentTerm && reply.VoteGranted{
 				rf.votes += 1
-				if rf.votes > len(rf.peers)/2{
+				if rf.currentTerm==currentTerm && rf.state==CANDIDATE && rf.votes > len(rf.peers)/2{
 					rf.mu.Unlock()
 					go rf.ConvertToLeader()
 					return
 				}
 				rf.mu.Unlock()
+				return
 			}
+			rf.mu.Unlock()
 		}(i)
 		i += 1
 	}
@@ -420,13 +429,14 @@ func (rf *Raft) ConvertToCandidate(){
 // 2. If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 func (rf *Raft) CheckCommitted(){
 	for{
-		rf.mu.Lock()
 		select{
 		case <- rf.stopLeaderAction:
+			rf.mu.Lock()
 			rf.persist()
 			rf.mu.Unlock()
 			return
-		default:
+		case <- time.After(10*time.Millisecond):
+			rf.mu.Lock()
 			maxN := getMedian(rf.matchIndex)
 
 			for i:=maxN;i>rf.commitIndex;i--{
@@ -443,8 +453,6 @@ func (rf *Raft) CheckCommitted(){
 				}
 			}
 			rf.mu.Unlock()
-
-			time.Sleep(10*time.Millisecond)
 		}
 	}
 }
@@ -466,8 +474,7 @@ func (rf *Raft) Check(){
 		select{
 			case <-rf.stopElectionCheck:
 				return
-			default:
-				time.Sleep(time.Duration(200 + rand.Intn(300)) * time.Millisecond)
+			case <- time.After(time.Duration(200 + rand.Intn(300)) * time.Millisecond):
 				go rf.CheckElectionTimeout()
 		}
 	}
