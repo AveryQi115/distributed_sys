@@ -196,7 +196,7 @@ func (rf *Raft) SendHeartBeat(){
 				rf.persist()
 				rf.mu.Unlock()
 				return
-			case <- time.After(30*time.Millisecond):
+			case <- time.After(60*time.Millisecond):
 				i := 0
 				for i < peerCount{
 					rf.mu.Lock()
@@ -286,11 +286,12 @@ func (rf *Raft) SendHeartBeat(){
 
 						// log matched, update nextIndex in the length limit
 						if ok && reply.Success{
-							if rf.matchIndex[i] <= prevLogIndex{
+							if len(args.Entries)>0{
+								rf.nextIndex[i] = prevLogIndex+len(args.Entries)+1
+								rf.matchIndex[i] = rf.nextIndex[i]-1
+							}else{
+								rf.nextIndex[i] = len(rf.logEntries)
 								rf.matchIndex[i] = prevLogIndex
-								if rf.nextIndex[i] < len(rf.logEntries){
-									rf.nextIndex[i] += 1
-								}
 							}
 							rf.persist()
 							rf.mu.Unlock()
@@ -396,7 +397,10 @@ func (rf *Raft) ConvertToCandidate(){
 				LastLogTerm		: logEntries[len(logEntries)-1].Term,
 			}
 			reply := RequestVoteReply{}
-			rf.sendRequestVote(i,&args,&reply)
+			ok := rf.sendRequestVote(i,&args,&reply)
+			if !ok{
+				return
+			}
 			rf.mu.Lock()
 			if reply.Term > rf.currentTerm{
 				rf.currentTerm = reply.Term		// 单增，只会在reply.Term更大的时候
@@ -564,19 +568,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply *AppendEntriesReply)
 		return
 	}
 
+	rf.lastHeartBeat = time.Now()
+
 	// the term of current server is behind the leader term, convert to follower, reset timer
 	if args.Term > rf.currentTerm{
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.lastHeartBeat = time.Now()
 		rf.persist()
 		rf.mu.Unlock()
 
 		go rf.ConvertToFollower()
 
 		rf.mu.Lock()
-	} else {
-		rf.lastHeartBeat = time.Now()
 	}
 
 	// prevLogIndex and prevLogTerm don't match, return false
